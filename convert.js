@@ -26,6 +26,9 @@
 //                          pass --query "" to suppress)
 //   --hide <selector>      CSS selector to hide during capture (repeatable) — useful
 //                          for stripping playback bars, debug panels, etc.
+//   --no-jsx-patch         Disable the on-the-fly animations.jsx rewrite. By default
+//                          the tool patches Claude-Design-style animations.jsx so it
+//                          exposes window.__capture and respects ?capture=1.
 //   --keep-frames          Keep PNG frames after encoding
 //   --no-server            Load file:// directly instead of via local HTTP server
 //   --help                 Show this help
@@ -74,6 +77,7 @@ function parseArgs(argv) {
       i++;
       continue;
     }
+    if (a === '--no-jsx-patch') { args.flags.noJsxPatch = true; continue; }
     if (a.startsWith('--')) {
       const key = a.slice(2);
       const val = argv[i + 1];
@@ -93,7 +97,7 @@ function printHelp() {
   const help = fs.readFileSync(__filename, 'utf8')
     .split('\n')
     .filter(l => l.startsWith('//'))
-    .slice(0, 50)
+    .slice(0, 55)
     .map(l => l.replace(/^\/\/ ?/, ''))
     .join('\n');
   console.log(help);
@@ -121,7 +125,78 @@ const MIME = {
   '.mp4' : 'video/mp4', '.webm': 'video/webm',
 };
 
-function startServer(rootDir, port) {
+// ── On-the-fly animations.jsx patcher ──────────────────────────────────────
+// Claude Design exports ship a <Stage> component (in animations.jsx) that
+// renders an on-screen playback bar and ignores ?capture=1. We proxy the file
+// through the static server and rewrite it in-memory so headless capture sees
+// a clean canvas + a window.__capture handle — without modifying the export.
+//
+// Defensive: all five anchors must match, otherwise the original source is
+// returned untouched. Idempotent: patching an already-patched file is a no-op
+// (the anchors won't match the replacements).
+function patchAnimationsJsx(src) {
+  const anchors = {
+    captureVar:   /const \[scale, setScale\] = React\.useState\(1\);/,
+    barH:         /const barH = 44;/,
+    handleBefore: /\}, \[duration\]\);\s*\n\s*const displayTime = hoverTime != null \? hoverTime : time;/,
+    canvasAttr:   /(<div\s+ref=\{canvasRef\}\s*)\n(\s*style=\{\{)/,
+    boxShadow:    /boxShadow: '0 20px 60px rgba\(0,0,0,0\.4\)',/,
+    playbackBar:  /(\{\/\* Playback bar[^*]*\*\/\})\s*\n\s*<PlaybackBar([\s\S]*?)\/>/,
+  };
+  for (const [name, re] of Object.entries(anchors)) {
+    if (!re.test(src)) return { src, patched: false, missing: name };
+  }
+
+  let out = src;
+  out = out.replace(
+    anchors.captureVar,
+    `const [scale, setScale] = React.useState(1);
+
+  // Injected by claude-design-html-to-mp4: capture mode hides UI chrome
+  // when the page is loaded with ?capture=1 (the tool's default).
+  const captureMode = typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).has('capture');`
+  );
+  out = out.replace(anchors.barH, `const barH = captureMode ? 0 : 44;`);
+  out = out.replace(
+    anchors.handleBefore,
+    `}, [duration]);
+
+  // Injected by claude-design-html-to-mp4: expose capture handle so the
+  // headless recorder can drive time deterministically (frame-by-frame).
+  React.useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handle = {
+      duration, fps, width, height,
+      selector: '[data-stage-canvas]',
+      setTime: (t) => setTime(clamp(Number(t) || 0, 0, duration)),
+      setPlaying: (b) => setPlaying(!!b),
+    };
+    window.__capture = handle;
+    return () => { if (window.__capture === handle) delete window.__capture; };
+  }, [duration, fps, width, height]);
+
+  const displayTime = hoverTime != null ? hoverTime : time;`
+  );
+  out = out.replace(
+    anchors.canvasAttr,
+    `$1\n          data-stage-canvas=""\n$2`
+  );
+  out = out.replace(
+    anchors.boxShadow,
+    `boxShadow: captureMode ? 'none' : '0 20px 60px rgba(0,0,0,0.4)',`
+  );
+  out = out.replace(
+    anchors.playbackBar,
+    (_, comment, body) => `${comment}\n      {!captureMode && (\n        <PlaybackBar${body}/>\n      )}`
+  );
+
+  return { src: out, patched: true };
+}
+
+function startServer(rootDir, port, opts = {}) {
+  const { patchJsx = true, onPatch = () => {} } = opts;
+
   const server = http.createServer((req, res) => {
     let urlPath = decodeURIComponent(req.url.split('?')[0]);
     if (urlPath === '/') urlPath = '/index.html';
@@ -140,12 +215,22 @@ function startServer(rootDir, port) {
         res.end(`Error: ${err.message}`);
         return;
       }
+
+      let body = data;
+      if (patchJsx && path.basename(filePath) === 'animations.jsx') {
+        const result = patchAnimationsJsx(data.toString('utf8'));
+        if (result.patched) {
+          body = Buffer.from(result.src, 'utf8');
+          onPatch(filePath);
+        }
+      }
+
       res.writeHead(200, {
         'Content-Type': mimeType,
         'Access-Control-Allow-Origin': '*',
         'Cache-Control': 'no-store',
       });
-      res.end(data);
+      res.end(body);
     });
   });
 
@@ -184,18 +269,34 @@ function checkFfmpeg() {
 
 // ── Parse Claude-design-style HTML for <Stage> prop hints ──────────────────
 // Zero-cost fallback when the page never exposes window.__capture (e.g. legacy
-// exports). Regex-matches the first <Stage ...> tag and pulls numeric props.
+// exports). Regex-matches the first <Stage ...> tag and pulls numeric props —
+// literals like `duration={30}` or variable refs like `duration={DURATION}`
+// resolved against a `const DURATION = 30;` elsewhere in the same file.
 function parseHtmlHints(htmlPath) {
   try {
     const src = fs.readFileSync(htmlPath, 'utf8');
     const m = src.match(/<\s*Stage\b([^>]*)>/);
     if (!m) return {};
     const attrs = m[1];
-    const num = (name) => {
-      const re = new RegExp(`\\b${name}\\s*=\\s*\\{\\s*(\\d+(?:\\.\\d+)?)\\s*\\}`);
-      const mm = attrs.match(re);
+
+    const resolveVar = (name) => {
+      const re = new RegExp(`(?:const|let|var)\\s+${name}\\s*=\\s*(\\d+(?:\\.\\d+)?)\\s*;?`);
+      const mm = src.match(re);
       return mm ? Number(mm[1]) : null;
     };
+
+    const num = (name) => {
+      const reLit = new RegExp(`\\b${name}\\s*=\\s*\\{\\s*(\\d+(?:\\.\\d+)?)\\s*\\}`);
+      const mLit = attrs.match(reLit);
+      if (mLit) return Number(mLit[1]);
+
+      const reVar = new RegExp(`\\b${name}\\s*=\\s*\\{\\s*([A-Za-z_$][A-Za-z0-9_$]*)\\s*\\}`);
+      const mVar = attrs.match(reVar);
+      if (mVar) return resolveVar(mVar[1]);
+
+      return null;
+    };
+
     return {
       width:    num('width'),
       height:   num('height'),
@@ -323,8 +424,18 @@ async function main() {
   }
 
   let server = null, pageUrl;
+  const patchJsx = !args.flags.noJsxPatch && !args.flags['no-jsx-patch'];
+  let jsxPatchLogged = false;
   if (USE_SERVER) {
-    server = await startServer(rootDir, PORT);
+    server = await startServer(rootDir, PORT, {
+      patchJsx,
+      onPatch: (fp) => {
+        if (!jsxPatchLogged) {
+          console.log(`  Patched on the fly: ${path.relative(rootDir, fp)} (capture mode)`);
+          jsxPatchLogged = true;
+        }
+      },
+    });
     pageUrl = `http://localhost:${PORT}/${encodeURI(htmlFile)}${QUERY ? '?' + QUERY : ''}`;
     console.log(`\nServing ${rootDir} at http://localhost:${PORT}`);
   } else {
