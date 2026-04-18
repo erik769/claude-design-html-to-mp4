@@ -1,0 +1,19 @@
+{
+  "name": "claude-design-html-to-mp4",
+  "version": "1.0.0",
+  "description": "General-purpose HTML (Claude design) to MP4 converter. Deterministic frame-stepped capture with realtime fallback.",
+  "main": "convert.js",
+  "bin": {
+    "html-to-mp4": "convert.js"
+  },
+  "scripts": {
+    "setup": "npm install && npx playwright install chromium",
+    "convert": "node convert.js"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

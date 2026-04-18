@@ -1,0 +1,7 @@
+node_modules/
+.html-to-mp4-frames-*/
+*.mp4
+*.webm
+*.log
+.DS_Store
+Thumbs.db
