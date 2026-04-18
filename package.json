@@ -1,7 +1,7 @@
 {
   "name": "claude-design-html-to-mp4",
   "version": "1.0.0",
-  "description": "General-purpose HTML (Claude design) to MP4 converter. Deterministic frame-stepped capture with realtime fallback.",
+  "description": "Render any HTML page — or a Claude Design export — to a silent MP4. Deterministic frame-stepped capture with a realtime fallback.",
   "main": "convert.js",
   "bin": {
     "html-to-mp4": "convert.js"
@@ -10,6 +10,8 @@
     "setup": "npm install && npx playwright install chromium",
     "convert": "node convert.js"
   },
+  "author": "Thinkagain.nl (https://thinkagain.nl)",
+  "license": "MIT",
   "dependencies": {
     "playwright": "^1.48.0"
   },
