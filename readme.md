@@ -23,7 +23,7 @@ The resulting video is always silent (H.264 / MP4). If you need narration or mus
 
 ## Installation
 
-Clone the repo, then run the setup script that matches your OS:
+Clone the repo, then run the setup script that matches your OS. You can aslo just ask your Claude Code to make it work:
 
 ```bash
 git clone <your-remote>/claude-design-html-to-mp4.git
